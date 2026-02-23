@@ -6,6 +6,7 @@ import './App.css'
 const DEFAULT_LOOKBACK_DAYS = 7
 const DEFAULT_MIN_AREA_KM2 = 1
 const DEFAULT_ACTIVE_LIMIT = 500
+const DEFAULT_AS_OF_DAY = '2021-08-19'
 const EMPTY_GEOJSON = { type: 'FeatureCollection', features: [] }
 
 function getTodayUtcDay() {
@@ -113,7 +114,7 @@ function App() {
   const mapRef = useRef(null)
   const popupRef = useRef(null)
 
-  const [asOfDay, setAsOfDay] = useState(getTodayUtcDay())
+  const [asOfDay, setAsOfDay] = useState(DEFAULT_AS_OF_DAY || getTodayUtcDay())
   const [lookbackDays, setLookbackDays] = useState(DEFAULT_LOOKBACK_DAYS)
   const [minAreaKm2, setMinAreaKm2] = useState(DEFAULT_MIN_AREA_KM2)
   const [detailMode, setDetailMode] = useState('overpass')
@@ -320,8 +321,33 @@ function App() {
         type: 'circle',
         source: 'active-fires',
         paint: {
-          'circle-radius': 16,
+          'circle-radius': 18,
           'circle-opacity': 0,
+        },
+      })
+
+      map.addLayer({
+        id: 'active-fire-circles',
+        type: 'circle',
+        source: 'active-fires',
+        paint: {
+          'circle-radius': [
+            'interpolate',
+            ['linear'],
+            ['coalesce', ['get', 'maxAreaKm2'], 0],
+            0,
+            6,
+            5,
+            9,
+            20,
+            13,
+            100,
+            18,
+          ],
+          'circle-color': '#fb923c',
+          'circle-opacity': 0.8,
+          'circle-stroke-color': '#7c2d12',
+          'circle-stroke-width': 1.2,
         },
       })
 
