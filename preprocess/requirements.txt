@@ -1,0 +1,2 @@
+fireatlas @ git+https://github.com/Earth-Information-System/fireatlas.git@conus-dps
+psycopg[binary]>=3.2

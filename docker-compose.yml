@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: wildfire-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wildfire
+      POSTGRES_USER: wildfire
+      POSTGRES_PASSWORD: wildfire
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./db:/db:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wildfire -d wildfire"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./backend
+    container_name: wildfire-api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 4000
+      DATABASE_URL: postgres://wildfire:wildfire@db:5432/wildfire
+    ports:
+      - "4000:4000"
+    command: npm run dev
+    volumes:
+      - ./backend/src:/app/src
+
+volumes:
+  postgres_data:
