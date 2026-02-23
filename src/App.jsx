@@ -8,6 +8,8 @@ const DEFAULT_MIN_AREA_KM2 = 1
 const DEFAULT_ACTIVE_LIMIT = 500
 const DEFAULT_AS_OF_DAY = '2021-08-19'
 const EMPTY_GEOJSON = { type: 'FeatureCollection', features: [] }
+const PLAYBACK_MS = 800
+const COLOR_STEPS = ['#fde68a', '#fdba74', '#fb923c', '#f97316', '#ea580c', '#c2410c', '#7c2d12']
 
 function getTodayUtcDay() {
   return new Date().toISOString().slice(0, 10)
@@ -78,13 +80,27 @@ function extendBoundsWithGeometry(bounds, geometry) {
   }
 }
 
+function getFeatureStep(feature) {
+  return Number(feature?.properties?.stepIndex || 0)
+}
+
+function filterToStep(features, maxStep) {
+  return (features || []).filter((feature) => getFeatureStep(feature) <= maxStep)
+}
+
+function latestFeatureAtStep(features, maxStep) {
+  const visible = filterToStep(features, maxStep)
+  if (visible.length === 0) return null
+  return visible.reduce((best, current) => (getFeatureStep(current) > getFeatureStep(best) ? current : best))
+}
+
 function AreaSparkline({ series }) {
   const points = useMemo(() => {
     if (!Array.isArray(series) || series.length === 0) return ''
-    const width = 260
-    const height = 72
-    const padding = 6
-    const values = series.map((item) => Number(item.areaKm2) || 0)
+    const width = 300
+    const height = 80
+    const padding = 8
+    const values = series.map((item) => Number(item.areaCumulativeKm2) || 0)
     const min = Math.min(...values)
     const max = Math.max(...values)
     const range = Math.max(max - min, 0.0001)
@@ -99,11 +115,11 @@ function AreaSparkline({ series }) {
   }, [series])
 
   if (!points) {
-    return <p className="muted">No perimeter timeline in this window.</p>
+    return <p className="muted">No cumulative timeline in this window.</p>
   }
 
   return (
-    <svg className="sparkline" viewBox="0 0 260 72" aria-label="Fire area timeline">
+    <svg className="sparkline" viewBox="0 0 300 80" aria-label="Cumulative fire area timeline">
       <path d={points} />
     </svg>
   )
@@ -113,11 +129,11 @@ function App() {
   const mapContainerRef = useRef(null)
   const mapRef = useRef(null)
   const popupRef = useRef(null)
+  const playIntervalRef = useRef(null)
 
   const [asOfDay, setAsOfDay] = useState(DEFAULT_AS_OF_DAY || getTodayUtcDay())
   const [lookbackDays, setLookbackDays] = useState(DEFAULT_LOOKBACK_DAYS)
   const [minAreaKm2, setMinAreaKm2] = useState(DEFAULT_MIN_AREA_KM2)
-  const [detailMode, setDetailMode] = useState('overpass')
 
   const [mapReady, setMapReady] = useState(false)
   const [loadingActive, setLoadingActive] = useState(false)
@@ -129,19 +145,66 @@ function App() {
 
   const [selectedFireId, setSelectedFireId] = useState(null)
   const [selectedFireDetail, setSelectedFireDetail] = useState(null)
+  const [visibleStep, setVisibleStep] = useState(0)
+  const [isPlaying, setIsPlaying] = useState(false)
 
   const mapToken = import.meta.env.VITE_MAPBOX_TOKEN || ''
   const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000').replace(/\/$/, '')
   const missingToken = !mapToken
 
+  const stepCount = selectedFireDetail?.series?.length || 0
+
+  const stopPlayback = useCallback(() => {
+    setIsPlaying(false)
+    if (playIntervalRef.current) {
+      window.clearInterval(playIntervalRef.current)
+      playIntervalRef.current = null
+    }
+  }, [])
+
   const clearSelectedPerimeters = useCallback(() => {
     const map = mapRef.current
     if (!map) return
-    const source = map.getSource('selected-fire-perimeters')
-    if (source) {
-      source.setData(EMPTY_GEOJSON)
-    }
+
+    const cumulativeSource = map.getSource('selected-cumulative')
+    if (cumulativeSource) cumulativeSource.setData(EMPTY_GEOJSON)
+
+    const growthSource = map.getSource('selected-growth')
+    if (growthSource) growthSource.setData(EMPTY_GEOJSON)
+
+    const latestSource = map.getSource('selected-latest')
+    if (latestSource) latestSource.setData(EMPTY_GEOJSON)
   }, [])
+
+  const applyVisiblePerimeters = useCallback((maxStep) => {
+    const map = mapRef.current
+    if (!map || !selectedFireDetail) return
+
+    const cumulativeFeatures = selectedFireDetail?.perimeters_cumulative?.features || []
+    const growthFeatures = selectedFireDetail?.perimeters_growth?.features || []
+
+    const visibleCumulative = filterToStep(cumulativeFeatures, maxStep)
+    const visibleGrowth = filterToStep(growthFeatures, maxStep)
+    const latest = latestFeatureAtStep(cumulativeFeatures, maxStep)
+
+    const cumulativeSource = map.getSource('selected-cumulative')
+    if (cumulativeSource) {
+      cumulativeSource.setData({ type: 'FeatureCollection', features: visibleCumulative })
+    }
+
+    const growthSource = map.getSource('selected-growth')
+    if (growthSource) {
+      growthSource.setData({ type: 'FeatureCollection', features: visibleGrowth })
+    }
+
+    const latestSource = map.getSource('selected-latest')
+    if (latestSource) {
+      latestSource.setData({
+        type: 'FeatureCollection',
+        features: latest ? [latest] : [],
+      })
+    }
+  }, [selectedFireDetail])
 
   const loadActiveFires = useCallback(async () => {
     const map = mapRef.current
@@ -174,10 +237,12 @@ function App() {
         type: 'FeatureCollection',
         features: Array.isArray(payload.features) ? payload.features : [],
       }
+
       const source = map.getSource('active-fires')
       if (!source) {
         throw new Error('Map source "active-fires" is not ready yet.')
       }
+
       source.setData(featureCollection)
       setActiveCount(Number(payload.count ?? featureCollection.features.length))
 
@@ -186,9 +251,12 @@ function App() {
           .map((feature) => Number(feature?.properties?.fireId))
           .filter((value) => Number.isFinite(value)),
       )
+
       if (selectedFireId && !visibleFireIds.has(selectedFireId)) {
         setSelectedFireId(null)
         setSelectedFireDetail(null)
+        setVisibleStep(0)
+        stopPlayback()
         clearSelectedPerimeters()
       }
 
@@ -207,12 +275,14 @@ function App() {
       setActiveCount(0)
       setSelectedFireId(null)
       setSelectedFireDetail(null)
+      setVisibleStep(0)
+      stopPlayback()
       clearSelectedPerimeters()
       setErrorMessage(error instanceof Error ? error.message : 'Unable to load active fires')
     } finally {
       setLoadingActive(false)
     }
-  }, [apiBaseUrl, asOfDay, clearSelectedPerimeters, lookbackDays, minAreaKm2, selectedFireId])
+  }, [apiBaseUrl, asOfDay, clearSelectedPerimeters, lookbackDays, minAreaKm2, selectedFireId, stopPlayback])
 
   const loadSelectedFireDetail = useCallback(async () => {
     const map = mapRef.current
@@ -225,9 +295,11 @@ function App() {
     const params = new URLSearchParams({
       asOf: asOfDay,
       lookbackDays: String(safeLookback),
-      mode: detailMode,
+      mode: 'overpass',
+      geometryMode: 'display',
       _t: String(Date.now()),
     })
+
     const requestUrl = `${apiBaseUrl}/active-fires/${selectedFireId}?${params.toString()}`
     setLastDetailRequest(requestUrl)
     setLoadingDetail(true)
@@ -241,20 +313,14 @@ function App() {
       }
 
       setSelectedFireDetail(payload)
+      const maxStep = payload?.series?.length ? Number(payload.series[payload.series.length - 1].stepIndex) : 0
+      setVisibleStep(maxStep)
+      stopPlayback()
 
-      const source = map.getSource('selected-fire-perimeters')
-      if (!source) {
-        throw new Error('Map source "selected-fire-perimeters" is not ready yet.')
-      }
-
-      const perimeters = payload.perimeters?.features
-        ? payload.perimeters
-        : EMPTY_GEOJSON
-      source.setData(perimeters)
-
-      if (Array.isArray(perimeters.features) && perimeters.features.length > 0) {
+      const allCumulative = payload?.perimeters_cumulative?.features || []
+      if (allCumulative.length > 0) {
         const bounds = new mapboxgl.LngLatBounds()
-        for (const feature of perimeters.features) {
+        for (const feature of allCumulative) {
           extendBoundsWithGeometry(bounds, feature.geometry)
         }
         if (!bounds.isEmpty()) {
@@ -262,13 +328,48 @@ function App() {
         }
       }
     } catch (error) {
-      clearSelectedPerimeters()
       setSelectedFireDetail(null)
+      setVisibleStep(0)
+      stopPlayback()
+      clearSelectedPerimeters()
       setErrorMessage(error instanceof Error ? error.message : 'Unable to load fire detail')
     } finally {
       setLoadingDetail(false)
     }
-  }, [apiBaseUrl, asOfDay, clearSelectedPerimeters, detailMode, lookbackDays, selectedFireId])
+  }, [apiBaseUrl, asOfDay, clearSelectedPerimeters, lookbackDays, selectedFireId, stopPlayback])
+
+  useEffect(() => {
+    if (!selectedFireDetail || visibleStep <= 0) {
+      clearSelectedPerimeters()
+      return
+    }
+    applyVisiblePerimeters(visibleStep)
+  }, [applyVisiblePerimeters, clearSelectedPerimeters, selectedFireDetail, visibleStep])
+
+  useEffect(() => {
+    if (stepCount <= 0) {
+      stopPlayback()
+      return
+    }
+    if (!isPlaying) return
+
+    playIntervalRef.current = window.setInterval(() => {
+      setVisibleStep((current) => {
+        if (current >= stepCount) {
+          stopPlayback()
+          return stepCount
+        }
+        return current + 1
+      })
+    }, PLAYBACK_MS)
+
+    return () => {
+      if (playIntervalRef.current) {
+        window.clearInterval(playIntervalRef.current)
+        playIntervalRef.current = null
+      }
+    }
+  }, [isPlaying, stepCount, stopPlayback])
 
   useEffect(() => {
     if (missingToken || !mapContainerRef.current) {
@@ -290,28 +391,54 @@ function App() {
         type: 'geojson',
         data: EMPTY_GEOJSON,
       })
-      map.addSource('selected-fire-perimeters', {
+      map.addSource('selected-cumulative', {
+        type: 'geojson',
+        data: EMPTY_GEOJSON,
+      })
+      map.addSource('selected-growth', {
+        type: 'geojson',
+        data: EMPTY_GEOJSON,
+      })
+      map.addSource('selected-latest', {
         type: 'geojson',
         data: EMPTY_GEOJSON,
       })
 
       map.addLayer({
-        id: 'selected-fire-fill',
+        id: 'selected-cumulative-fill',
         type: 'fill',
-        source: 'selected-fire-perimeters',
+        source: 'selected-cumulative',
         paint: {
-          'fill-color': '#f97316',
-          'fill-opacity': 0.2,
+          'fill-color': ['coalesce', ['get', 'colorHex'], '#f97316'],
+          'fill-opacity': [
+            'interpolate',
+            ['linear'],
+            ['coalesce', ['get', 'ageNorm'], 0],
+            0,
+            0.12,
+            1,
+            0.45,
+          ],
         },
       })
 
       map.addLayer({
-        id: 'selected-fire-line',
-        type: 'line',
-        source: 'selected-fire-perimeters',
+        id: 'selected-growth-fill',
+        type: 'fill',
+        source: 'selected-growth',
         paint: {
-          'line-color': '#c2410c',
-          'line-width': 2.4,
+          'fill-color': ['coalesce', ['get', 'colorHex'], '#ea580c'],
+          'fill-opacity': 0.55,
+        },
+      })
+
+      map.addLayer({
+        id: 'selected-latest-line',
+        type: 'line',
+        source: 'selected-latest',
+        paint: {
+          'line-color': '#7c2d12',
+          'line-width': 2.8,
           'line-opacity': 0.95,
         },
       })
@@ -345,7 +472,7 @@ function App() {
             18,
           ],
           'circle-color': '#fb923c',
-          'circle-opacity': 0.8,
+          'circle-opacity': 0.82,
           'circle-stroke-color': '#7c2d12',
           'circle-stroke-width': 1.2,
         },
@@ -421,6 +548,7 @@ function App() {
     mapRef.current = map
 
     return () => {
+      stopPlayback()
       if (popupRef.current) {
         popupRef.current.remove()
         popupRef.current = null
@@ -429,7 +557,7 @@ function App() {
       mapRef.current = null
       setMapReady(false)
     }
-  }, [mapToken, missingToken])
+  }, [mapToken, missingToken, stopPlayback])
 
   useEffect(() => {
     if (!mapReady) return
@@ -453,12 +581,18 @@ function App() {
     ? [...selectedFireDetail.series].slice(-8).reverse()
     : []
 
+  const latestVisibleSlice = useMemo(() => {
+    if (!Array.isArray(selectedFireDetail?.series)) return null
+    const visible = selectedFireDetail.series.filter((row) => Number(row.stepIndex) <= visibleStep)
+    if (visible.length === 0) return null
+    return visible[visible.length - 1]
+  }, [selectedFireDetail, visibleStep])
+
   return (
     <main className="app">
       <h1>Wildfire Viewer</h1>
       <p className="lede">
-        Active fires in the selected window are shown as flame markers. Click one to inspect perimeter
-        evolution and area over time.
+        Archive-only progressive perimeters: cumulative fire growth is shown from earliest to latest overpass.
       </p>
 
       <form className="controls" onSubmit={onRefresh}>
@@ -490,13 +624,6 @@ function App() {
             onChange={(event) => setMinAreaKm2(Number(event.target.value) || 0)}
           />
         </label>
-        <label>
-          Perimeter mode
-          <select value={detailMode} onChange={(event) => setDetailMode(event.target.value)}>
-            <option value="overpass">Per overpass</option>
-            <option value="daily">Daily</option>
-          </select>
-        </label>
         <button type="submit" disabled={missingToken || !mapReady || loadingActive}>
           {loadingActive ? 'Loading...' : 'Refresh'}
         </button>
@@ -516,13 +643,22 @@ function App() {
 
       <section className="layout">
         <div className="map-wrap">
+          <div className="legend">
+            <span>Earliest</span>
+            <div className="legend-swatches">
+              {COLOR_STEPS.map((color) => (
+                <span key={color} style={{ background: color }} />
+              ))}
+            </div>
+            <span>Latest</span>
+          </div>
           <div ref={mapContainerRef} className="map" />
-          {loadingDetail && <div className="map-loading">Loading fire detail...</div>}
+          {loadingDetail && <div className="map-loading">Loading progressive perimeters...</div>}
         </div>
 
         <aside className="detail-panel">
           <h2>Fire Detail</h2>
-          {!selectedFireId && <p className="muted">Click a fire marker to inspect its perimeter history.</p>}
+          {!selectedFireId && <p className="muted">Click a fire marker to inspect its progression timeline.</p>}
 
           {selectedFireId && selectedFireDetail && (
             <>
@@ -545,22 +681,77 @@ function App() {
                   <strong>{formatNumber(selectedFireDetail.summary?.totalFrpSum, 1)}</strong>
                 </div>
                 <div>
-                  <span>Overpasses</span>
+                  <span>Overpass steps</span>
                   <strong>{formatNumber(selectedFireDetail.summary?.overpassCount, 0)}</strong>
                 </div>
               </div>
 
-              <h3>Area Over Time</h3>
+              <h3>Timeline</h3>
+              <div className="timeline-controls">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!stepCount) return
+                    setVisibleStep(1)
+                    setIsPlaying(true)
+                  }}
+                  disabled={stepCount <= 0}
+                >
+                  ▶ Play
+                </button>
+                <button
+                  type="button"
+                  onClick={stopPlayback}
+                  disabled={!isPlaying}
+                >
+                  ❚❚ Pause
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    stopPlayback()
+                    setVisibleStep(stepCount)
+                  }}
+                  disabled={stepCount <= 0}
+                >
+                  ⤓ Show All
+                </button>
+              </div>
+
+              <input
+                className="timeline-slider"
+                type="range"
+                min="1"
+                max={Math.max(stepCount, 1)}
+                value={Math.max(visibleStep, 1)}
+                onChange={(event) => {
+                  stopPlayback()
+                  setVisibleStep(Number(event.target.value))
+                }}
+                disabled={stepCount <= 0}
+              />
+
+              <p className="timeline-status">
+                Step <strong>{Math.max(visibleStep, 0)}</strong> / <strong>{stepCount}</strong>
+                {latestVisibleSlice && (
+                  <span>
+                    {' '}· {formatUtcDateTime(latestVisibleSlice.stepTime)} · cumulative area{' '}
+                    <strong>{formatNumber(latestVisibleSlice.areaCumulativeKm2, 2)} km²</strong>
+                  </span>
+                )}
+              </p>
+
+              <h3>Cumulative Area</h3>
               <AreaSparkline series={selectedFireDetail.series || []} />
 
-              <h3>Latest Slices</h3>
-              {latestSlices.length === 0 && <p className="muted">No slices available.</p>}
+              <h3>Latest Steps</h3>
+              {latestSlices.length === 0 && <p className="muted">No steps available.</p>}
               {latestSlices.length > 0 && (
                 <ul className="slice-list">
                   {latestSlices.map((slice) => (
-                    <li key={slice.time}>
-                      <span>{formatUtcDateTime(slice.time)}</span>
-                      <strong>{formatNumber(slice.areaKm2, 2)} km²</strong>
+                    <li key={slice.stepTime}>
+                      <span>{formatUtcDateTime(slice.stepTime)}</span>
+                      <strong>{formatNumber(slice.areaCumulativeKm2, 2)} km²</strong>
                     </li>
                   ))}
                 </ul>

@@ -1,5 +1,9 @@
 -- Run with:
 -- docker compose exec -T db psql -U wildfire -d wildfire -c "\copy fire_detections_stage FROM STDIN WITH (FORMAT csv, HEADER true)" < path/to/fire_data.csv
+\if :{?source_file}
+\else
+\set source_file unknown
+\endif
 
 INSERT INTO fire_detections (
   latitude,
@@ -8,7 +12,10 @@ INSERT INTO fire_detections (
   frp,
   confidence,
   satellite,
-  daynight
+  daynight,
+  source_type,
+  source_version,
+  source_file
 )
 SELECT
   latitude::DOUBLE PRECISION,
@@ -23,9 +30,17 @@ SELECT
   CASE
     WHEN upper(daynight) IN ('D', 'N') THEN upper(daynight)
     ELSE NULL
-  END
+  END,
+  CASE
+    WHEN upper(NULLIF(version, '')) LIKE '%NRT%' THEN 'nrt'
+    ELSE 'archive'
+  END,
+  NULLIF(version, ''),
+  :'source_file'
 FROM fire_detections_stage
 WHERE latitude ~ '^-?[0-9]+(\.[0-9]+)?$'
   AND longitude ~ '^-?[0-9]+(\.[0-9]+)?$'
   AND acq_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
   AND acq_time ~ '^[0-9]{1,4}$';
+
+TRUNCATE fire_detections_stage;

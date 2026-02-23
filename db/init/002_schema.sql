@@ -28,7 +28,7 @@ CREATE INDEX IF NOT EXISTS fire_detections_source_time_idx
 CREATE TABLE IF NOT EXISTS fire_detections_stage (
   latitude TEXT,
   longitude TEXT,
-  bright_ti4 TEXT,
+  brightness TEXT,
   scan TEXT,
   track TEXT,
   acq_date TEXT,
@@ -37,8 +37,8 @@ CREATE TABLE IF NOT EXISTS fire_detections_stage (
   instrument TEXT,
   confidence TEXT,
   version TEXT,
-  daynight TEXT,
-  bright_ti5 TEXT,
+  bright_t31 TEXT,
   frp TEXT,
+  daynight TEXT,
   type TEXT
 );
